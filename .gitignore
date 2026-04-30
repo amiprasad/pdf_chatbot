@@ -1,0 +1,23 @@
+# Environment
+.env
+*.pyc
+__pycache__/
+*.egg-info/
+.eggs/
+
+# Data (user uploads and DB)
+data/uploads/
+data/qdrant_storage/
+data/app.db
+
+# Python venv
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/
