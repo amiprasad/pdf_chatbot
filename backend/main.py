@@ -26,9 +26,15 @@ app = FastAPI(
 )
 
 # ── CORS (allow Streamlit frontend on port 8501) ─────────────────────
+# ── CORS (allow Streamlit frontend) ───────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
+    allow_origins=[
+        "http://localhost:8501", 
+        "http://127.0.0.1:8501",
+        "https://pdf-chatbot-frontend-6o4g.onrender.com",  # Add your frontend URL
+        "*"  # Temporarily allow all origins for testing
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
