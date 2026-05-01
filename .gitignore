@@ -8,7 +8,10 @@ __pycache__/
 # Data (user uploads and DB)
 data/uploads/
 data/qdrant_storage/
+data/quadrant_storage/
 data/app.db
+data/
+*.db
 
 # Python venv
 venv/
@@ -21,3 +24,7 @@ env/
 
 # Streamlit
 .streamlit/
+
+# Windows
+Thumbs.db
+desktop.ini

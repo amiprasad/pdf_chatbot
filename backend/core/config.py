@@ -15,6 +15,7 @@ class Settings:
     # API Keys
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
+    HUGGINGFACE_API_KEY: str = os.getenv("HUGGINGFACE_API_KEY", "")
 
     # JWT
     SECRET_KEY: str = os.getenv("SECRET_KEY", "change-me-in-production")

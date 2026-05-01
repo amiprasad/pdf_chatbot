@@ -73,7 +73,13 @@ def generate_answer(
         {"answer": str, "sources": [str, ...]}
     """
     # ── Step 1: Retrieve relevant chunks ────────────────────────────
-    hits = search_similar(user_id, document_id, question, top_k=4)
+    hits = search_similar(
+        user_id, 
+        document_id, 
+        question, 
+        top_k=4,
+        search_type="mmr",   # diverse, non-redundant results
+        )
 
     if not hits:
         return {
@@ -85,10 +91,11 @@ def generate_answer(
     context_parts = []
     sources = []
     for hit in hits:
-        page_num = hit["page"] + 1  # 0-indexed → human-readable
-        excerpt = hit["text"][:300]  # first 300 chars as source snippet
-        context_parts.append(f"[Page {page_num}]\n{hit['text']}")
-        sources.append(f"Page {page_num}: {excerpt}...")
+        # Use chunk_index since we now chunk by text, not by page
+        chunk_idx = hit.get("chunk_index", hit.get("page", 0))
+        excerpt = hit["text"][:300]
+        context_parts.append(f"[Chunk {chunk_idx}]\n{hit['text']}")
+        sources.append(f"Chunk {chunk_idx}: {excerpt}...")
 
     context = "\n\n---\n\n".join(context_parts)
 

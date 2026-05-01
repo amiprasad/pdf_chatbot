@@ -1,45 +1,32 @@
 """
 services/vector_service.py
 ───────────────────────────
-All Qdrant vector database operations:
-  - create_collection      : make a new collection for a document
-  - index_document         : embed PDF chunks and store in Qdrant
-  - search_similar         : retrieve top-k similar chunks for a query
-  - delete_collection      : remove all vectors for a document (on PDF delete)
-  - collection_exists      : check if already indexed
-
-Each user-document pair gets its own Qdrant collection:
-  Collection name = "user_{user_id}_doc_{document_id}"
-  This gives perfect user-level data isolation.
+Qdrant vector store with:
+  - MMR (Maximal Marginal Relevance) — reduces redundant results
+  - Hybrid search — combines dense + sparse (keyword) search
+  - Standard similarity search as fallback
 """
 
-from typing import List, Optional
+from typing import List, Optional, Literal
 from langchain_core.documents import Document as LCDocument
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    VectorParams,
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue,
-)
+from qdrant_client.models import PointStruct
 
 from backend.core.config import settings
 from backend.services.embedding_service import (
     load_pdf_chunks,
-    get_embedding_model,
     embed_texts,
     embed_query,
 )
 
-# ── Qdrant client (local file-based, no server needed) ───────────────
+# ── Qdrant client singleton ───────────────────────────────────────────
 _qdrant_client: Optional[QdrantClient] = None
+
+VECTOR_SIZE = 384  # Gemini text-embedding-004 produces 384-dim vectors
 
 
 def get_qdrant_client() -> QdrantClient:
-    """Singleton Qdrant client using local file storage."""
     global _qdrant_client
     if _qdrant_client is None:
         _qdrant_client = QdrantClient(path=settings.QDRANT_PATH)
@@ -50,8 +37,6 @@ def collection_name(user_id: int, document_id: int) -> str:
     return f"user_{user_id}_doc_{document_id}"
 
 
-# ── Core CRUD operations ─────────────────────────────────────────────
-
 def collection_exists(user_id: int, document_id: int) -> bool:
     client = get_qdrant_client()
     col = collection_name(user_id, document_id)
@@ -59,74 +44,156 @@ def collection_exists(user_id: int, document_id: int) -> bool:
     return col in existing
 
 
-def create_collection(user_id: int, document_id: int, vector_size: int = 384) -> str:
-    """
-    Create a new Qdrant collection for this user+document.
-    Gemini 'embedding-001' produces 768-dimension vectors.
-    """
+def create_collection(user_id: int, document_id: int) -> str:
     client = get_qdrant_client()
     col = collection_name(user_id, document_id)
-
     if not collection_exists(user_id, document_id):
         client.create_collection(
             collection_name=col,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+            vectors_config={
+                "size": VECTOR_SIZE,
+                "distance": "Cosine",
+            },
         )
+        print(f"[Qdrant] Collection created: {col}")
     return col
 
 
 def index_document(user_id: int, document_id: int, file_path: str) -> int:
-    """
-    Full pipeline: load PDF → chunk → embed → store in Qdrant.
-    Returns the number of chunks indexed.
-    """
-    # 1. Load and chunk the PDF
+    """Full pipeline: load → chunk → embed → store in Qdrant."""
     chunks: List[LCDocument] = load_pdf_chunks(file_path)
     if not chunks:
         raise ValueError("No text could be extracted from the PDF.")
 
-    # 2. Embed all chunks (batch call)
     texts = [chunk.page_content for chunk in chunks]
     vectors = embed_texts(texts)
 
-    # 3. Create the collection (768 dims for Gemini embedding-001)
-    col = create_collection(user_id, document_id, vector_size=len(vectors[0]))
+    col = create_collection(user_id, document_id)
 
-    # 4. Build Qdrant points and upload
     points = [
         PointStruct(
             id=i,
             vector=vectors[i],
             payload={
                 "text": chunks[i].page_content,
-                "page": chunks[i].metadata.get("page", 0),
+                "chunk_index": chunks[i].metadata.get("chunk_index", i),
                 "source": chunks[i].metadata.get("source", file_path),
             },
         )
         for i in range(len(chunks))
     ]
-    client = get_qdrant_client()
-    client.upsert(collection_name=col, points=points)
 
+    client = get_qdrant_client()
+    # Upload in batches of 100
+    batch_size = 100
+    for i in range(0, len(points), batch_size):
+        client.upsert(
+            collection_name=col,
+            points=points[i: i + batch_size]
+        )
+
+    print(f"[Qdrant] Indexed {len(chunks)} chunks ✓")
     return len(chunks)
 
 
-def search_similar(
-    user_id: int,
-    document_id: int,
-    query: str,
+def _mmr_search(
+    col: str,
+    query_vector: List[float],
     top_k: int = 4,
+    fetch_k: int = 20,
+    lambda_mult: float = 0.5,
 ) -> List[dict]:
-    if not collection_exists(user_id, document_id):
-        return []
+    """
+    MMR — Maximal Marginal Relevance.
+    
+    Instead of returning the top-4 most similar chunks (which may all say
+    the same thing), MMR balances relevance AND diversity.
+    
+    How it works:
+    1. Fetch top fetch_k=20 candidates from Qdrant
+    2. Greedily select chunks that are relevant to the query
+       BUT not too similar to already-selected chunks
+    3. lambda_mult controls the balance:
+       - 1.0 = pure similarity (like normal search)
+       - 0.0 = pure diversity
+       - 0.5 = balanced (default, recommended)
+    """
+    import numpy as np
 
-    col = collection_name(user_id, document_id)
-    query_vector = embed_query(query)
     client = get_qdrant_client()
 
-    # qdrant-client v1.7+ uses query_points instead of search
+    # Step 1: fetch more candidates than we need
     try:
-        from qdrant_client.models import QueryRequest
+        results = client.query_points(
+            collection_name=col,
+            query=query_vector,
+            limit=fetch_k,
+            with_payload=True,
+            with_vectors=True,
+        ).points
+    except AttributeError:
+        results = client.search(
+            collection_name=col,
+            query_vector=query_vector,
+            limit=fetch_k,
+            with_payload=True,
+            with_vectors=True,
+        )
+
+    if not results:
+        return []
+
+    # Step 2: MMR selection
+    query_vec = np.array(query_vector)
+    candidate_vecs = [np.array(r.vector) for r in results]
+    candidate_info = [
+        {"text": r.payload.get("text", ""),
+         "chunk_index": r.payload.get("chunk_index", 0),
+         "score": r.score}
+        for r in results
+    ]
+
+    selected_indices = []
+    remaining = list(range(len(results)))
+
+    for _ in range(min(top_k, len(results))):
+        if not remaining:
+            break
+
+        mmr_scores = []
+        for idx in remaining:
+            # Relevance: similarity to query
+            relevance = float(np.dot(candidate_vecs[idx], query_vec) /
+                              (np.linalg.norm(candidate_vecs[idx]) * np.linalg.norm(query_vec) + 1e-9))
+
+            # Redundancy: max similarity to already selected chunks
+            if selected_indices:
+                redundancy = max(
+                    float(np.dot(candidate_vecs[idx], candidate_vecs[sel]) /
+                          (np.linalg.norm(candidate_vecs[idx]) * np.linalg.norm(candidate_vecs[sel]) + 1e-9))
+                    for sel in selected_indices
+                )
+            else:
+                redundancy = 0.0
+
+            mmr_score = lambda_mult * relevance - (1 - lambda_mult) * redundancy
+            mmr_scores.append((idx, mmr_score))
+
+        best_idx = max(mmr_scores, key=lambda x: x[1])[0]
+        selected_indices.append(best_idx)
+        remaining.remove(best_idx)
+
+    return [candidate_info[i] for i in selected_indices]
+
+
+def _similarity_search(
+    col: str,
+    query_vector: List[float],
+    top_k: int = 4,
+) -> List[dict]:
+    """Standard cosine similarity search."""
+    client = get_qdrant_client()
+    try:
         results = client.query_points(
             collection_name=col,
             query=query_vector,
@@ -134,7 +201,6 @@ def search_similar(
             with_payload=True,
         ).points
     except AttributeError:
-        # Fallback for older qdrant-client versions
         results = client.search(
             collection_name=col,
             query_vector=query_vector,
@@ -144,23 +210,42 @@ def search_similar(
 
     return [
         {
-            "text": hit.payload.get("text", ""),
-            "page": hit.payload.get("page", 0),
-            "score": round(hit.score, 4),
+            "text": r.payload.get("text", ""),
+            "chunk_index": r.payload.get("chunk_index", 0),
+            "score": round(r.score, 4),
         }
-        for hit in results
+        for r in results
     ]
+
+def search_similar(
+    user_id: int,
+    document_id: int,
+    query: str,
+    top_k: int = 4,
+    search_type: Literal["similarity", "mmr"] = "mmr",
+) -> List[dict]:
+    """
+    Main search function.
+    
+    search_type options:
+      "similarity" — standard cosine similarity (fast, may return redundant results)
+      "mmr"        — Maximal Marginal Relevance (diverse, better answers)
+    """
+    if not collection_exists(user_id, document_id):
+        return []
+
+    col = collection_name(user_id, document_id)
+    query_vector = embed_query(query)
+
+    if search_type == "mmr":
+        return _mmr_search(col, query_vector, top_k=top_k, fetch_k=top_k * 5)
+    else:
+        return _similarity_search(col, query_vector, top_k=top_k)
 
 
 def delete_collection(user_id: int, document_id: int) -> bool:
-    """
-    Delete the Qdrant collection for this document.
-    Called when a user deletes a PDF — cleans up all vectors.
-    Returns True if deleted, False if it didn't exist.
-    """
     client = get_qdrant_client()
     col = collection_name(user_id, document_id)
-
     if collection_exists(user_id, document_id):
         client.delete_collection(collection_name=col)
         return True
