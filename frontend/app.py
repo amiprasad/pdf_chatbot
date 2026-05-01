@@ -14,7 +14,8 @@ import time
 from datetime import datetime
 
 # ── Config ───────────────────────────────────────────────────────────
-API_BASE = "http://localhost:8000"
+import os
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 
 # ── Session state helpers ─────────────────────────────────────────────
